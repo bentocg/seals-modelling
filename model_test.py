@@ -17,6 +17,8 @@ from pyro.contrib.autoguide import AutoMultivariateNormal
 from pyro.infer.mcmc.api import MCMC
 from pyro.infer.mcmc import NUTS
 import pyro.optim as optim
+from pyro.util import optional
+from pyro import poutine
 
 pyro.set_rng_seed(1)
 
@@ -29,6 +31,7 @@ pyro.set_rng_seed(1)
 # Draw fake parameters -- set number of patches and subpatches
 SUBPATCHES_IN_PATCH = 16
 N_PATCHES = 100
+N_CHAINS = 3
 training_data = pd.DataFrame()
 
 
@@ -82,11 +85,14 @@ fp_sampler = dist.Poisson(3)
 
 # add seal counts to training data
 training_data = training_data.assign(N_obs=
-    obs_sampler.sample() +
-    fp_sampler.sample([N_PATCHES, SUBPATCHES_IN_PATCH]),
-    N_ice=N_ice)
+                                     obs_sampler.sample() +
+                                     fp_sampler.sample([N_PATCHES, SUBPATCHES_IN_PATCH]),
+                                     N_ice=N_ice)
+
 
 # define model
+
+
 def model(data):
     # model parameters
     lambda_total = 0.
@@ -96,7 +102,7 @@ def model(data):
 
     # softplus transform link function
     softplus = torch.nn.Softplus()
-     
+
     # hyperparameter starting values
     a_tot = pyro.sample('a_tot', dist.Normal(8., 1000.))
     b_tot = pyro.sample('b_tot', dist.Normal(0., 1.))
@@ -104,54 +110,52 @@ def model(data):
     b_con = pyro.sample('b_con', dist.Normal(0., 1.))
     a_fp = pyro.sample('a_fp', dist.Normal(8., 1000.))
     b_fp = pyro.sample('b_fp', dist.Normal(0., 1.))
-    a1_det0 = pyro.sample('a1_det0', dist.Beta(1,1))
-    b_det0 = pyro.sample('b_det0', dist.Beta(1,1))
-    a1_det1 = pyro.sample('a1_det1', dist.Beta(1,1))
-    b_det1 = pyro.sample('b_det1', dist.Beta(1,1))
-   
+    a1_det0 = pyro.sample('a1_det0', dist.Beta(1, 1))
+    b_det0 = pyro.sample('b_det0', dist.Beta(1, 1))
+    a1_det1 = pyro.sample('a1_det1', dist.Beta(1, 1))
+    b_det1 = pyro.sample('b_det1', dist.Beta(1, 1))
+
     # model hierarchy
-    with pyro.iarange('data_loop', N_PATCHES):
+    with pyro.plate('patches', N_PATCHES):
         # linear regression for paramters
-        lambda_total = softplus(torch.Tensor([a_tot * torch.Tensor(data.chl.values) + b_tot]))
-        concentration_subp = softplus(a_con * torch.Tensor(data.flo_size.values) + b_con)
-        false_pos = softplus(a_fp * torch.Tensor(data.sea_ice_subp.values) + b_fp)
+        lambda_total = softplus(a_tot * torch.Tensor(data.chl.values) + b_tot)
 
         # draws total population size
-        N_total = pyro.sample("N_total", dist.Poisson(lambda_total))
+        with poutine.block():
+            N_total = pyro.sample("N_total", dist.Poisson(lambda_total))
 
         # draw haulout probability at the patch level
         haul_prob_patch = pyro.sample('haul_prob_patch', dist.Beta(torch.Tensor([1]), torch.Tensor([1])))
 
-        # draw total number of seals on ice
-        N_ice = pyro.sample(f"N_ice", dist.DirichletMultinomial(total_count=(N_total * haul_prob_patch).int(), 
-        concentration=concentration_subp), obs=torch.Tensor(data.N_ice))
+        with pyro.plate('subpatches', SUBPATCHES_IN_PATCH):
+            concentration_subp = softplus(a_con * torch.Tensor(data.flo_size) + b_con)
+            false_pos = softplus(a_fp * torch.Tensor(data.sea_ice_subp) + b_fp)
 
-        # get observed seals (includes false-positives)
-        False_pos =  pyro.sample("False_pos", dist.Poisson(false_pos))
-        det_probs = pyro.sample('det_probs', dist.Beta(softplus(a1_det0 * torch.Tensor(data.sea_ice_subp) + b_det0),
-        a1_det1 * torch.Tensor(data.sea_ice_subp) + b_det1))
-        pyro.sample("N_obs", dist.Binomial(N_ice + False_pos * det_probs, det_probs), obs=torch.Tensor(data.N_obs))
+            # draw total number of seals on ice
+            N_ice = pyro.sample("N_ice", dist.DirichletMultinomial(total_count=(N_total * haul_prob_patch).int(),
+                                                                   concentration=concentration_subp),
+                                obs=torch.Tensor(data.N_ice))
 
-def guide(data):
-    softplus = torch.nn.Softplus()
-    a_tot_loc = pyro.param('a_tot_loc', torch.Tensor(0.))
-    a_tot_scale = pyro.param('a_tot_scale', torch.Tensor(0.))
-    b_tot_loc = pyro.param('b_tot_loc', torch.Tensor(0.))
-    b_tot_scale = pyro.param('b_tot_scale', torch.Tensor(0.)) 
-    a_tot = pyro.sample('a_tot', dist.Normal(a_tot_loc, a_tot_scale))
-    b_tot = pyro.sample('b_tot', dist.Normal(b_tot_loc, b_tot_scale))
-    haul_prob_patch = pyro.sample('haul_prob_patch', dist.Beta(0, 0))
-    haul_prob_subp = pyro.sample('haul_prob_subp', dist.Beta(0, 0))
-    det_probs = pyro.sample('det_probs', dist.Beta(0, 0))
-    lambda_total = softplus(a_tot * data.cl + b_tot)
+            # get observed seals (includes false-positives)
+            #print(N_ice.shape)
+            #print(dist.Poisson(false_pos).sample().shape)
+            #False_pos = pyro.sample("False_pos", dist.Poisson(false_pos))
+            #det_probs = pyro.sample('det_probs', dist.Beta(softplus(a1_det0 * torch.Tensor(data.sea_ice_subp) + b_det0),
+            #                                               a1_det1 * torch.Tensor(data.sea_ice_subp) + b_det1))
+            #pyro.sample("N_obs", dist.Binomial(N_ice + False_pos / det_probs, det_probs), obs=torch.Tensor(data.N_obs))
 
 
 nuts_kernel = NUTS(model)
+intial_params = {'a_tot': torch.zeros([N_CHAINS]),
+                 'b_tot': torch.zeros([N_CHAINS]),
+                 'a_con': torch.zeros([N_CHAINS]),
+                 'b_con': torch.zeros([N_CHAINS]),
+                 'a_fp': torch.zeros([N_CHAINS]),
+                 'b_fp': torch.zeros([N_CHAINS])}
 
-mcmc = MCMC(nuts_kernel, num_samples=1000, warmup_steps=200)
+
+mcmc = MCMC(nuts_kernel, num_samples=1000, warmup_steps=200, num_chains=N_CHAINS)
 mcmc.run(training_data)
 
-hmc_samples = {k: v.detach().cpu().numpy() for k, v in mcmc.get_samples().items()}
 
-
-
+#hmc_samples = {k: v.detach().cpu().numpy() for k, v in mcmc.get_samples().items()}
