@@ -8,15 +8,12 @@ from pyro.distributions.util import broadcast_shape
 from pyro.infer import Trace_ELBO, TraceEnum_ELBO, config_enumerate
 import pyro.poutine as poutine
 from pyro.optim import Adam
-from pyro.infer.mcmc.api import MCMC
-from pyro.infer.mcmc import NUTS
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
 from functools import partial
 
 smoke_test = ('CI' in os.environ)
 pyro.enable_validation(True) 
-torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
  # <---- This is always a good idea!
 
@@ -148,13 +145,13 @@ def model_fun1(data, observe):
         for i in pyro.irange('rows', N_rows):
             N_ice = pyro.sample(f'N_ice_{i}',
                                 dist.DirichletMultinomial(concentration=haul_prob_subp[i, :],
-                                                          total_count=N_total[i], 
+                                                          total_count=max(0, N_total[i]), 
                                                           validate_args=False),
                                 obs=gt_N_ice[i, :])
             for j in pyro.irange(f'cols_{i}', N_cols):
                 pyro.sample(f'N_det_{i}_{j}',
-                            dist.Binomial(total_count=(N_ice[j] +
-                                                       false_pos[i, j] / det_prob_subp[i, j]).int(),
+                            dist.Binomial(total_count=max(0, (N_ice[j] +
+                                                       false_pos[i, j] / det_prob_subp[i, j])).int(),
                                           probs=det_prob_subp[i, j]),
                             obs=gt_N_obs[i, j])
 
@@ -169,4 +166,5 @@ svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 n_steps = 2501
 for step in range(n_steps):
     svi.step(data)
-# HMC will not work with latent discrete variables
+
+
